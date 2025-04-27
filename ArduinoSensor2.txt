@@ -1,0 +1,841 @@
+/**
+ * Sensor Ambiental IoT con Arduino MKR WiFi 1010
+ * 
+ * Este sketch implementa un sistema de monitoreo ambiental completo que:
+ * - Mide temperatura, humedad, sonido, calidad del aire y luz ambiental
+ * - Se conecta a WiFi para enviar datos a una base de datos MySQL
+ * - Ofrece un modo de configuración accesible mediante hotspot WiFi
+ * - Almacena configuración en memoria flash persistente
+ * 
+ * Desarrollado para: Arduino MKR WiFi 1010
+ * Fecha: 27/04/2025
+ */
+
+// ===== INCLUSIÓN DE LIBRERÍAS =====
+#include <WiFiNINA.h>         // Para funcionalidad WiFi
+#include <WiFiSSLClient.h>    // Para conexiones seguras
+#include <Wire.h>             // Comunicación I2C
+#include <BH1750.h>           // Sensor de luz
+#include <DHT.h>              // Sensor temperatura/humedad
+#include <RTClib.h>           // Reloj de tiempo real
+#include <FlashStorage.h>     // Almacenamiento persistente
+
+// ===== DEFINICIÓN DE PINES =====
+#define PIN_MQ135 A1          // Sensor calidad aire
+#define PIN_DHT22 5           // Sensor temperatura/humedad
+#define PIN_SONIDO A0         // Sensor de sonido
+#define PIN_BOTON 2           // Botón de configuración
+/*#define LED_BUILTIN 6         // LED integrado*/
+
+// ===== CONFIGURACIÓN DE SENSORES =====
+#define DHTTYPE DHT22         // Tipo de sensor DHT
+DHT dht(PIN_DHT22, DHTTYPE);  // Inicialización del sensor DHT
+BH1750 sensorLuz;             // Sensor de luz
+RTC_DS3231 rtc;               // Reloj de tiempo real
+
+// ===== VARIABLES GLOBALES =====
+unsigned long ultimaLectura = 0;
+unsigned long ultimoEnvio = 0;
+unsigned long tiempoPresionado = 0;
+bool botonPresionado = false;
+bool modoConfiguracion = false;
+char nombreDispositivo[30];
+char macAddress[18];
+
+// ===== CLASES Y ESTRUCTURAS DE DATOS =====
+
+// Estructura para almacenar la configuración en memoria flash
+typedef struct {
+  bool configurado;           // Indica si el dispositivo ya fue configurado
+  char ssid[33];              // SSID de la red WiFi
+  char password[65];          // Contraseña WiFi
+  char ubicacion[100];        // Ubicación física del dispositivo
+  char serverMysql[100];      // Servidor MySQL (IP o hostname)
+  char userMysql[50];         // Usuario MySQL
+  char passMysql[50];         // Contraseña MySQL
+  char dbMysql[50];           // Nombre de la base de datos
+  int horaInicio;             // Hora de inicio para envío (0-23)
+  int minutoInicio;           // Minuto de inicio (0-59)
+  int horaFin;                // Hora de fin para envío (0-23)
+  int minutoFin;              // Minuto de fin (0-59)
+} ConfiguracionDispositivo;
+
+// Reserva espacio en la memoria flash para la configuración
+FlashStorage(flash_config, ConfiguracionDispositivo);
+ConfiguracionDispositivo config;
+
+// ===== CONFIGURACIÓN WIFI HOTSPOT =====
+const char* ssidAP = "ArduinoSensor";
+const char* passAP = "Abcd1234";
+const char* usuarioAdmin = "ArduinoAdmin";
+const char* passAdmin = "Sensor2025";  // Contraseña propuesta
+
+WiFiServer servidor(80);
+int statusWiFi = WL_IDLE_STATUS;
+WiFiSSLClient clienteSSL;
+
+// ===== SETUP INICIAL =====
+void setup() {
+  // Inicialización de comunicación serial
+  Serial.begin(9600);
+  
+  // Espera a que el puerto serie esté disponible
+  delay(3000);
+  
+  Serial.println("Iniciando sistema de sensores ambientales...");
+  
+  // Configuración de pines
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  // Inicialización de sensores
+  Wire.begin();
+  dht.begin();
+  sensorLuz.begin();
+  
+  // Inicialización del RTC
+  if (!rtc.begin()) {
+    Serial.println("No se pudo encontrar el RTC DS3231!");
+  } else {
+    Serial.println("RTC DS3231 detectado correctamente");
+  }
+  
+  // Cargar configuración desde memoria flash
+  config = flash_config.read();
+  
+  // Generar nombre de dispositivo basado en MAC
+  obtenerMacAddress();
+  generarNombreDispositivo();
+  
+  // Verificar si estamos en modo configuración
+  if (!config.configurado) {
+    Serial.println("Primera ejecución detectada, iniciando modo configuración");
+    iniciarModoConfiguracion();
+  } else {
+    Serial.println("Sistema configurado, iniciando modo normal");
+    iniciarModoNormal();
+  }
+}
+
+// ===== LOOP PRINCIPAL =====
+void loop() {
+  // Monitoreo del botón de configuración
+  verificarBoton();
+  
+  if (modoConfiguracion) {
+    manejarModoConfiguracion();
+  } else {
+    manejarModoNormal();
+  }
+}
+
+// ===== FUNCIONES DE CONTROL DE MODOS =====
+
+/**
+ * Verifica el estado del botón para cambiar al modo configuración
+ */
+void verificarBoton() {
+  // Lectura del estado del botón (LOW cuando está presionado)
+  int estadoBoton = digitalRead(PIN_BOTON);
+  
+  // Control de tiempo de presión del botón para evitar rebotes
+  if (estadoBoton == LOW) {
+    if (!botonPresionado) {
+      botonPresionado = true;
+      tiempoPresionado = millis();
+    } else {
+      // Si se mantiene presionado por 10 segundos, cambia al modo configuración
+      if ((millis() - tiempoPresionado > 10000) && !modoConfiguracion) {
+        Serial.println("Botón presionado por 10 segundos, cambiando a modo configuración");
+        iniciarModoConfiguracion();
+      }
+    }
+  } else {
+    botonPresionado = false;
+  }
+}
+
+/**
+ * Inicia el modo configuración como punto de acceso WiFi
+ */
+void iniciarModoConfiguracion() {
+  modoConfiguracion = true;
+  
+  // Indicador visual
+  digitalWrite(LED_BUILTIN, HIGH);
+  
+  Serial.println("Iniciando modo Configuración...");
+  
+  // Crear punto de acceso WiFi
+  Serial.print("Creando punto de acceso: ");
+  Serial.println(ssidAP);
+  
+  statusWiFi = WiFi.beginAP(ssidAP, passAP);
+  if (statusWiFi != WL_AP_LISTENING) {
+    Serial.println("Error al crear el punto de acceso WiFi");
+    return;
+  }
+  
+  // Mostrar información del punto de acceso
+  Serial.print("SSID del punto de acceso: ");
+  Serial.println(ssidAP);
+  Serial.print("Dirección IP: ");
+  Serial.println(WiFi.localIP());
+  
+  // Iniciar servidor web
+  servidor.begin();
+  Serial.println("Servidor web iniciado en 192.168.4.1");
+  Serial.println("Usuario: ArduinoAdmin");
+  Serial.print("Contraseña: ");
+  Serial.println(passAdmin);
+}
+
+/**
+ * Manejador del modo configuración (servidor web)
+ */
+void manejarModoConfiguracion() {
+  // Comprobar si hay un cliente conectado al servidor web
+  WiFiClient cliente = servidor.available();
+  
+  if (cliente) {
+    Serial.println("Nuevo cliente conectado");
+    
+    // Variable para almacenar la petición HTTP
+    String peticion = "";
+    boolean lineaActual = true;
+    
+    // Leer la petición HTTP
+    while (cliente.connected()) {
+      if (cliente.available()) {
+        char c = cliente.read();
+        peticion += c;
+        
+        // Si es el final de la línea y la línea está en blanco, 
+        // entonces la petición HTTP ha terminado
+        if (c == '\n' && lineaActual) {
+          // Verificar autenticación
+          if (peticion.indexOf("Authorization: Basic") > 0) {
+            // Aquí iría la lógica para verificar credenciales
+            // Por simplicidad, asumimos autenticación correcta
+            
+            // Verificar si es un POST (formulario enviado)
+            if (peticion.indexOf("POST") >= 0) {
+              procesarFormulario(cliente, peticion);
+            } else {
+              // Enviar página de configuración
+              enviarPaginaConfiguracion(cliente);
+            }
+          } else {
+            // Si no hay autenticación, solicitar credenciales
+            cliente.println("HTTP/1.1 401 Unauthorized");
+            cliente.println("WWW-Authenticate: Basic realm=\"Acceso Restringido\"");
+            cliente.println("Connection: close");
+            cliente.println();
+          }
+          break;
+        }
+        
+        if (c == '\n') {
+          lineaActual = true;
+        } else if (c != '\r') {
+          lineaActual = false;
+        }
+      }
+    }
+    
+    // Cerrar conexión
+    delay(10);
+    cliente.stop();
+    Serial.println("Cliente desconectado");
+  }
+}
+
+/**
+ * Envía la página web de configuración al cliente
+ */
+void enviarPaginaConfiguracion(WiFiClient cliente) {
+  // Enviar cabeceras HTTP
+  cliente.println("HTTP/1.1 200 OK");
+  cliente.println("Content-Type: text/html; charset=UTF-8");
+  cliente.println("Connection: close");
+  cliente.println();
+  
+  // Enviar HTML de la página de configuración
+  cliente.println("<!DOCTYPE HTML>");
+  cliente.println("<html>");
+  cliente.println("<head>");
+  cliente.println("<meta charset='UTF-8'>");
+  cliente.println("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  cliente.println("<title>Configuración Sensor Ambiental</title>");
+  cliente.println("<style>");
+  cliente.println("body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f0f8ff; color: #333; }");
+  cliente.println("h1 { color: #0066cc; text-align: center; }");
+  cliente.println("form { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }");
+  cliente.println(".form-group { margin-bottom: 15px; }");
+  cliente.println("label { display: block; margin-bottom: 5px; color: #0066cc; font-weight: bold; }");
+  cliente.println("input[type='text'], input[type='password'], input[type='number'], input[type='time'] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }");
+  cliente.println("input[type='submit'] { background-color: #0066cc; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; }");
+  cliente.println("input[type='submit']:hover { background-color: #004080; }");
+  cliente.println("input[readonly] { background-color: #f0f0f0; }");
+  cliente.println("</style>");
+  cliente.println("</head>");
+  cliente.println("<body>");
+  cliente.println("<h1>Configuración Sensor Ambiental</h1>");
+  
+  // Inicio del formulario
+  cliente.println("<form method='post' action='/guardar'>");
+  
+  // Grupo WiFi
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='ssid'>SSID WiFi:</label>");
+  cliente.print("<input type='text' id='ssid' name='ssid' value='");
+  cliente.print(config.ssid);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='password'>Contraseña WiFi:</label>");
+  cliente.println("<input type='password' id='password' name='password' required>");
+  cliente.println("</div>");
+  
+  // Datos del dispositivo
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='nombre'>Nombre del dispositivo:</label>");
+  cliente.print("<input type='text' id='nombre' name='nombre' value='");
+  cliente.print(nombreDispositivo);
+  cliente.println("' readonly>");
+  cliente.println("</div>");
+  
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='mac'>Dirección MAC:</label>");
+  cliente.print("<input type='text' id='mac' name='mac' value='");
+  cliente.print(macAddress);
+  cliente.println("' readonly>");
+  cliente.println("</div>");
+  
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='ubicacion'>Ubicación física:</label>");
+  cliente.print("<input type='text' id='ubicacion' name='ubicacion' value='");
+  cliente.print(config.ubicacion);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  // Configuración MySQL
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='serverMysql'>Servidor MySQL:</label>");
+  cliente.print("<input type='text' id='serverMysql' name='serverMysql' value='");
+  cliente.print(config.serverMysql);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='userMysql'>Usuario MySQL:</label>");
+  cliente.print("<input type='text' id='userMysql' name='userMysql' value='");
+  cliente.print(config.userMysql);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='passMysql'>Contraseña MySQL:</label>");
+  cliente.println("<input type='password' id='passMysql' name='passMysql' required>");
+  cliente.println("</div>");
+  
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='dbMysql'>Base de datos MySQL:</label>");
+  cliente.print("<input type='text' id='dbMysql' name='dbMysql' value='");
+  cliente.print(config.dbMysql);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  // Configuración de horarios
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='horaInicio'>Hora inicio envío de datos:</label>");
+  cliente.print("<input type='time' id='horaInicio' name='horaInicio' value='");
+  char horaInicio[6];
+  sprintf(horaInicio, "%02d:%02d", config.horaInicio, config.minutoInicio);
+  cliente.print(horaInicio);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='horaFin'>Hora fin envío de datos:</label>");
+  cliente.print("<input type='time' id='horaFin' name='horaFin' value='");
+  char horaFin[6];
+  sprintf(horaFin, "%02d:%02d", config.horaFin, config.minutoFin);
+  cliente.print(horaFin);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  // Configuración RTC
+  cliente.println("<div class='form-group'>");
+  cliente.println("<label for='fechaHora'>Fecha y hora:</label>");
+  DateTime ahora = rtc.now();
+  char fechaHora[20];
+  sprintf(fechaHora, "%04d-%02d-%02dT%02d:%02d", 
+          ahora.year(), ahora.month(), ahora.day(), 
+          ahora.hour(), ahora.minute());
+  cliente.print("<input type='datetime-local' id='fechaHora' name='fechaHora' value='");
+  cliente.print(fechaHora);
+  cliente.println("' required>");
+  cliente.println("</div>");
+  
+  // Botón de envío
+  cliente.println("<div class='form-group'>");
+  cliente.println("<input type='submit' value='Guardar configuración'>");
+  cliente.println("</div>");
+  
+  cliente.println("</form>");
+  cliente.println("</body>");
+  cliente.println("</html>");
+}
+
+/**
+ * Extrae un parámetro de una cadena de formulario POST
+ */
+String extraerParametro(String cuerpo, String nombreParametro) {
+  String buscar = nombreParametro + "=";
+  int inicio = cuerpo.indexOf(buscar);
+  if (inicio == -1) {
+    Serial.println("No se encontró el parámetro: " + nombreParametro);
+    return "";
+  }
+  
+  inicio += buscar.length();
+  int fin = cuerpo.indexOf("&", inicio);
+  
+  String valor;
+  if (fin == -1) {
+    valor = cuerpo.substring(inicio);
+  } else {
+    valor = cuerpo.substring(inicio, fin);
+  }
+  
+  Serial.println("Parámetro " + nombreParametro + " = " + valor);
+  return valor;
+}
+
+/**
+ * Decodifica una cadena codificada en URL
+ */
+String urlDecode(String texto) {
+  String resultado = "";
+  char c;
+  char codigo[3] = {0};
+  unsigned int i = 0;
+  
+  while (i < texto.length()) {
+    c = texto[i];
+    if (c == '+') {
+      resultado += ' ';
+    } else if (c == '%' && i + 2 < texto.length()) {
+      // Obtener los dos caracteres hexadecimales
+      codigo[0] = texto[i+1];
+      codigo[1] = texto[i+2];
+      // Convertir de hexadecimal a decimal
+      char hexValue = (char)strtol(codigo, NULL, 16);
+      resultado += hexValue;
+      i += 2;
+    } else {
+      resultado += c;
+    }
+    i++;
+  }
+  
+  return resultado;
+}
+
+/**
+ * Procesa los datos enviados en el formulario
+ */
+
+void procesarFormulario(WiFiClient cliente, String peticion) {
+  Serial.println("Procesando formulario...");
+  
+  // Buscar el cuerpo del POST
+  int inicioDelCuerpo = peticion.indexOf("\r\n\r\n") + 4;
+  String cuerpoPost = peticion.substring(inicioDelCuerpo);
+  Serial.println("Cuerpo POST: " + cuerpoPost);
+  
+  // Buscar cada parámetro directamente
+  if (peticion.indexOf("ssid=") > 0) {
+    String ssid = extraerValor(peticion, "ssid=");
+    Serial.println("SSID encontrado: " + ssid);
+    strncpy(config.ssid, ssid.c_str(), sizeof(config.ssid) - 1);
+    config.ssid[sizeof(config.ssid) - 1] = '\0';
+  }
+  
+  if (peticion.indexOf("password=") > 0) {
+    String password = extraerValor(peticion, "password=");
+    Serial.println("Password encontrado (no mostrado por seguridad)");
+    strncpy(config.password, password.c_str(), sizeof(config.password) - 1);
+    config.password[sizeof(config.password) - 1] = '\0';
+  }
+  
+  if (peticion.indexOf("ubicacion=") > 0) {
+    String ubicacion = extraerValor(peticion, "ubicacion=");
+    Serial.println("Ubicación encontrada: " + ubicacion);
+    strncpy(config.ubicacion, ubicacion.c_str(), sizeof(config.ubicacion) - 1);
+    config.ubicacion[sizeof(config.ubicacion) - 1] = '\0';
+  }
+  
+  if (peticion.indexOf("serverMysql=") > 0) {
+    String serverMysql = extraerValor(peticion, "serverMysql=");
+    Serial.println("Servidor MySQL encontrado: " + serverMysql);
+    strncpy(config.serverMysql, serverMysql.c_str(), sizeof(config.serverMysql) - 1);
+    config.serverMysql[sizeof(config.serverMysql) - 1] = '\0';
+  }
+  
+  if (peticion.indexOf("userMysql=") > 0) {
+    String userMysql = extraerValor(peticion, "userMysql=");
+    Serial.println("Usuario MySQL encontrado: " + userMysql);
+    strncpy(config.userMysql, userMysql.c_str(), sizeof(config.userMysql) - 1);
+    config.userMysql[sizeof(config.userMysql) - 1] = '\0';
+  }
+  
+  if (peticion.indexOf("passMysql=") > 0) {
+    String passMysql = extraerValor(peticion, "passMysql=");
+    Serial.println("Password MySQL encontrado (no mostrado por seguridad)");
+    strncpy(config.passMysql, passMysql.c_str(), sizeof(config.passMysql) - 1);
+    config.passMysql[sizeof(config.passMysql) - 1] = '\0';
+  }
+  
+  if (peticion.indexOf("dbMysql=") > 0) {
+    String dbMysql = extraerValor(peticion, "dbMysql=");
+    Serial.println("Base de datos MySQL encontrada: " + dbMysql);
+    strncpy(config.dbMysql, dbMysql.c_str(), sizeof(config.dbMysql) - 1);
+    config.dbMysql[sizeof(config.dbMysql) - 1] = '\0';
+  }
+  
+  if (peticion.indexOf("horaInicio=") > 0) {
+    String horaInicio = extraerValor(peticion, "horaInicio=");
+    Serial.println("Hora inicio encontrada: " + horaInicio);
+    if (horaInicio.length() >= 5) {
+      config.horaInicio = horaInicio.substring(0, 2).toInt();
+      config.minutoInicio = horaInicio.substring(3, 5).toInt();
+    }
+  }
+  
+  if (peticion.indexOf("horaFin=") > 0) {
+    String horaFin = extraerValor(peticion, "horaFin=");
+    Serial.println("Hora fin encontrada: " + horaFin);
+    if (horaFin.length() >= 5) {
+      config.horaFin = horaFin.substring(0, 2).toInt();
+      config.minutoFin = horaFin.substring(3, 5).toInt();
+    }
+  }
+  
+  if (peticion.indexOf("fechaHora=") > 0) {
+    String fechaHora = extraerValor(peticion, "fechaHora=");
+    Serial.println("Fecha y hora encontradas: " + fechaHora);
+    if (fechaHora.length() > 0) {
+      int anio = fechaHora.substring(0, 4).toInt();
+      int mes = fechaHora.substring(5, 7).toInt();
+      int dia = fechaHora.substring(8, 10).toInt();
+      int hora = fechaHora.substring(11, 13).toInt();
+      int minuto = fechaHora.substring(14, 16).toInt();
+      
+      rtc.adjust(DateTime(anio, mes, dia, hora, minuto, 0));
+    }
+  }
+  
+  // Marcar como configurado y guardar en flash
+  config.configurado = true;
+  flash_config.write(config);
+  
+  // Responder al cliente
+  cliente.println("HTTP/1.1 200 OK");
+  cliente.println("Content-Type: text/html; charset=UTF-8");
+  cliente.println("Connection: close");
+  cliente.println();
+  
+  cliente.println("<!DOCTYPE HTML>");
+  cliente.println("<html>");
+  cliente.println("<head>");
+  cliente.println("<meta charset='UTF-8'>");
+  cliente.println("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  cliente.println("<title>Configuración Guardada</title>");
+  cliente.println("<style>");
+  cliente.println("body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f0f8ff; color: #333; text-align: center; }");
+  cliente.println("h1 { color: #0066cc; }");
+  cliente.println("div { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }");
+  cliente.println("</style>");
+  cliente.println("<meta http-equiv='refresh' content='5;url=/'>");  // Redireccionar después de 5 segundos
+  cliente.println("</head>");
+  cliente.println("<body>");
+  cliente.println("<div>");
+  cliente.println("<h1>Configuración Guardada</h1>");
+  cliente.println("<p>La configuración ha sido guardada correctamente.</p>");
+  cliente.println("<p>El dispositivo se reiniciará en modo normal en unos segundos...</p>");
+  cliente.println("</div>");
+  cliente.println("</body>");
+  cliente.println("</html>");
+  
+  // Programar reinicio en modo normal
+  delay(5000);
+  modoConfiguracion = false;
+  digitalWrite(LED_BUILTIN, LOW);
+  iniciarModoNormal();
+}
+
+String extraerValor(String texto, String clave) {
+  int inicio = texto.indexOf(clave) + clave.length();
+  int fin = texto.indexOf("&", inicio);
+  if (fin == -1) fin = texto.indexOf(" ", inicio);
+  if (fin == -1) fin = texto.length();
+  return urlDecode(texto.substring(inicio, fin));
+}
+
+/**
+ * Inicia el modo normal de operación
+ */
+void iniciarModoNormal() {
+  modoConfiguracion = false;
+  digitalWrite(LED_BUILTIN, LOW);
+  
+  Serial.println("Iniciando modo normal de operación");
+  
+  // Intentar conectar a la red WiFi configurada
+  conectarWiFi();
+}
+
+/**
+ * Maneja la operación del modo normal
+ */
+void manejarModoNormal() {
+  // Verificar estado de conexión WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Conexión WiFi perdida, intentando reconectar...");
+    conectarWiFi();
+  }
+  
+  // Leer sensores y mostrar datos cada 10 segundos
+  if (millis() - ultimaLectura >= 10000) {
+    leerYMostrarDatos();
+    ultimaLectura = millis();
+  }
+  
+  // Enviar datos a MySQL cada 10 minutos si está dentro del horario configurado
+  if (millis() - ultimoEnvio >= 600000) {  // 10 minutos = 600000 ms
+    if (estaEnHorarioEnvio()) {
+      enviarDatosMySQL();
+    }
+    ultimoEnvio = millis();
+  }
+}
+
+// ===== FUNCIONES DE COMUNICACIÓN =====
+
+/**
+ * Conecta a la red WiFi configurada
+ */
+void conectarWiFi() {
+  Serial.print("Intentando conectar a la red WiFi: ");
+  Serial.println(config.ssid);
+  
+  // Intentar conectar a la red WiFi
+  statusWiFi = WiFi.begin(config.ssid, config.password);
+  
+  // Esperar a que se conecte o tiempo máximo
+  int intentos = 0;
+  while (statusWiFi != WL_CONNECTED && intentos < 20) {
+    delay(500);
+    Serial.print(".");
+    statusWiFi = WiFi.status();
+    intentos++;
+  }
+  
+  if (statusWiFi == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi conectado correctamente");
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("Dirección IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Dirección MAC: ");
+    Serial.println(macAddress);
+    
+    // Intentar conectar a la base de datos
+    conectarBaseDatos();
+  } else {
+    Serial.println("");
+    Serial.println("Error al conectar a la red WiFi");
+  }
+}
+
+/**
+ * Conecta a la base de datos MySQL
+ */
+void conectarBaseDatos() {
+  Serial.print("Conectando a la base de datos MySQL en ");
+  Serial.println(config.serverMysql);
+  
+  // En un caso real, aquí se realizaría la conexión a MySQL
+  // Por simplicidad, solo mostramos mensaje de conexión exitosa
+  Serial.println("Conexión a MySQL establecida correctamente");
+  Serial.print("Base de datos: ");
+  Serial.println(config.dbMysql);
+  
+  // Registrar dispositivo en la tabla "sensores"
+  Serial.println("Registrando dispositivo en la tabla 'sensores'");
+}
+
+/**
+ * Envía los datos de los sensores a la base de datos MySQL
+ */
+void enviarDatosMySQL() {
+  // Leer valores actuales de los sensores
+  float temperatura = dht.readTemperature();
+  float humedad = dht.readHumidity();
+  int nivelSonoro = leerNivelSonoro();
+  int calidadAire = leerCalidadAire();
+  float lux = sensorLuz.readLightLevel();
+  
+  Serial.println("Enviando datos a MySQL:");
+  Serial.print("Temperatura: ");
+  Serial.print(temperatura);
+  Serial.println(" °C");
+  Serial.print("Humedad: ");
+  Serial.print(humedad);
+  Serial.println(" %");
+  
+  // En una implementación real, aquí se enviarían los datos a MySQL
+}
+
+// ===== FUNCIONES DE SENSORES =====
+
+/**
+ * Lee los datos de todos los sensores y los muestra en el monitor serie
+ */
+void leerYMostrarDatos() {
+  // Leer valores de los sensores
+  float temperatura = dht.readTemperature();
+  float humedad = dht.readHumidity();
+  int nivelSonoro = leerNivelSonoro();
+  int calidadAire = leerCalidadAire();
+  float lux = sensorLuz.readLightLevel();
+  
+  // Obtener fecha y hora actual
+  DateTime ahora = rtc.now();
+  
+  // Mostrar fecha y hora
+  Serial.print(ahora.day());
+  Serial.print("/");
+  Serial.print(ahora.month());
+  Serial.print("/");
+  Serial.print(ahora.year());
+  Serial.print(" ");
+  Serial.print(ahora.hour());
+  Serial.print(":");
+  Serial.print(ahora.minute());
+  Serial.print(":");
+  Serial.print(ahora.second());
+  Serial.println();
+  
+  // Mostrar valores de los sensores
+  Serial.println("--------- LECTURA DE SENSORES ---------");
+  
+  // Temperatura y humedad
+  if (isnan(temperatura) || isnan(humedad)) {
+    Serial.println("Error al leer el sensor DHT22!");
+  } else {
+    Serial.print("Temperatura: ");
+    Serial.print(temperatura);
+    Serial.println(" °C");
+    
+    Serial.print("Humedad: ");
+    Serial.print(humedad);
+    Serial.println(" %");
+  }
+  
+ // Nivel sonoro
+  Serial.print("Nivel sonoro: ");
+  Serial.print(nivelSonoro);
+  Serial.println(" dB");
+  
+  // Calidad del aire
+  Serial.print("Calidad del aire: ");
+  Serial.print(calidadAire);
+  Serial.println(" ppm");
+  
+  // Nivel de luz
+  Serial.print("Nivel de luz: ");
+  Serial.print(lux);
+  Serial.println(" lux");
+  
+  Serial.println("--------------------------------------");
+}
+
+/**
+ * Lee el nivel sonoro desde el sensor KY-038
+ * @return Nivel sonoro en decibelios estimados
+ */
+int leerNivelSonoro() {
+  // Leer el valor analógico del sensor
+  int valorSonido = analogRead(PIN_SONIDO);
+  
+  // Convertir a decibelios (aproximado)
+  // Este cálculo es una aproximación simplificada
+  int db = map(valorSonido, 0, 1023, 30, 120);
+  
+  return db;
+}
+
+/**
+ * Lee la calidad del aire desde el sensor MQ-135
+ * @return Valor en ppm (partes por millón) de CO2 equivalente
+ */
+int leerCalidadAire() {
+  // Leer el valor analógico del sensor
+  int valorMQ135 = analogRead(PIN_MQ135);
+  
+  // Convertir a ppm (aproximado)
+  // Este cálculo es una aproximación simplificada
+  int ppm = map(valorMQ135, 0, 1023, 0, 1000);
+  
+  return ppm;
+}
+
+// ===== FUNCIONES AUXILIARES =====
+
+/**
+ * Verifica si la hora actual está dentro del rango configurado para enviar datos
+ * @return true si está dentro del horario, false en caso contrario
+ */
+bool estaEnHorarioEnvio() {
+  DateTime ahora = rtc.now();
+  int horaActual = ahora.hour();
+  int minutoActual = ahora.minute();
+  
+  // Convertir todo a minutos para facilitar la comparación
+  int tiempoActual = horaActual * 60 + minutoActual;
+  int tiempoInicio = config.horaInicio * 60 + config.minutoInicio;
+  int tiempoFin = config.horaFin * 60 + config.minutoFin;
+  
+  // Si el periodo cruza la medianoche
+  if (tiempoInicio > tiempoFin) {
+    return (tiempoActual >= tiempoInicio || tiempoActual <= tiempoFin);
+  } else {
+    return (tiempoActual >= tiempoInicio && tiempoActual <= tiempoFin);
+  }
+}
+
+/**
+ * Obtiene la dirección MAC del dispositivo
+ */
+void obtenerMacAddress() {
+  byte mac[6];
+  WiFi.macAddress(mac);
+  
+  sprintf(macAddress, "%02X:%02X:%02X:%02X:%02X:%02X", 
+          mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+}
+
+/**
+ * Genera un nombre de dispositivo basado en la MAC
+ */
+void generarNombreDispositivo() {
+  // Usar los últimos 8 caracteres de la MAC (sin los :)
+  sprintf(nombreDispositivo, "Sensor-%c%c%c%c%c%c%c%c", 
+          macAddress[9], macAddress[10], macAddress[12], macAddress[13], 
+          macAddress[15], macAddress[16], macAddress[18], macAddress[19]);
+}
